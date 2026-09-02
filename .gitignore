@@ -1,0 +1,12 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+TestResults/
+coverage/
+.flax/
+shadow/
+daemon.log
+*.log
+release/*.zip

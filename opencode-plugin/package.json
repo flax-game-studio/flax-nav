@@ -1,0 +1,7 @@
+{
+  "name": "flax-nav-opencode-plugin",
+  "type": "module",
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.25"
+  }
+}
