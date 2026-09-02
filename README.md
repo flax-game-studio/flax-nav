@@ -1,70 +1,49 @@
-# FlaxNav — by Flax Game Studio
+# FlaxNav by Flax Game Studio
 
-Fast C# + Flax API navigator for Flax Engine. Standalone, MIT.
+Fast C# + Flax API navigator for Flax Engine. MIT.
 
-> Part of the Flax Game Studio ecosystem. Works on its own. More exists.
+Part of Flax Game Studio ecosystem.
 
 ## What it does
 
-| Family | Atomics |
-|---|---|
-| `csharp/*` | `find_definition`, `find_references`, `symbol_search`, `find_implementations`, `get_call_hierarchy`, `describe_symbol`, `find_related_symbols`, `index_health` |
-| `flax_api/*` | `lookup`, `search`, `members_of`, `enum_values`, `inheritance_chain` (from `FlaxEngine.CSharp.xml`) |
-| `docs/*` | `find_section`, `find_doc`, `grep` |
-
-Plus `atlas/diff_tree`, `plugin/catalog`, `receipt/*` for factory users.
+- `csharp/*` — find_definition, find_references, symbol_search, get_call_hierarchy
+- `flax_api/*` — lookup, search, members_of, enum_values (from FlaxEngine.CSharp.xml)
+- `docs/*` — find_section, find_doc, grep
 
 ## How it works
 
-Daemon on `\\.\pipe\flaxmcp-nav` — 8 concurrent handlers, Windows. Managed source-text scan (no Roslyn, no heavy SDK). Indexes build on demand or via `--warm`, ~50-300ms per query. File watcher + TTL keeps index fresh.
+Daemon on `\\.\pipe\flaxmcp-nav`. Managed scan, no Roslyn. ~50-300ms. File watcher keeps index fresh.
 
 ## Requirements
 
-- .NET 8 SDK, Windows 10/11
+.NET 8, Windows 10/11
 
 ## Install
 
-**From source:**
 ```pwsh
 dotnet build flaxmcp-nav.csproj -c Release
-# -> bin/Release/net8.0/flaxmcp-nav.exe
+# or download zip from Releases
 ```
-
-**From Release:**
-Download `flax-nav-v2.3.0-with-plugin-win-x64.zip` from Releases — contains `flaxmcp-nav.exe`, deps, `nav.ps1`, `opencode-plugin/`.
 
 ## Quick start
 
 ```pwsh
-.\bin\Release\net8.0\flaxmcp-nav.exe csharp/symbol_search query=Bridge maxResults=10
-.\bin\Release\net8.0\flaxmcp-nav.exe csharp/find_definition symbolName=Player
-.\bin\Release\net8.0\flaxmcp-nav.exe flax_api/search query=Physics maxResults=5
-
-pwsh nav.ps1 csharp/symbol_search query=Bridge
-flaxmcp-nav.exe --daemon
+.\bin\Release\net8.0\flaxmcp-nav.exe csharp/symbol_search query=Bridge
+.\bin\Release\net8.0\flaxmcp-nav.exe flax_api/search query=Physics
+pwsh nav.ps1 csharp/find_definition symbolName=Player
 flaxmcp-nav.exe --health
 ```
 
-`nav.ps1` defaults to `FLAXMCP_NAV_AUTOSPAWN=1` (auto-spawn if daemon missing). Set `0` for connect-only.
-
 ## OpenCode plugin
 
-Blocks `edit`/`write` on `.cs` until you verify the real API via `flaxnav`. Prevents `CS0117`/`CS0246` and Unity slips.
-
-- Per-file verification (30 min), 3-edit window (`MAX_EDITS_PER_NAV=3`)
-- Unity-ism detection (`MonoBehaviour`→`Script`, `GameObject`→`Actor`, `Rigidbody`→`RigidBody`, `Time.deltaTime`→`Time.DeltaTime`)
-- Compile-breaker detection (`CS0104` vector ambiguity, `??=`)
+Blocks `edit` on `.cs` until `flaxnav` verifies the API. Prevents CS0117/CS0246 and Unity code.
 
 ```jsonc
 "plugin": ["./opencode-plugin/flaxmcp-nav.ts", "./opencode-plugin/cs-edit-gates.mjs"]
 ```
 
-See `opencode-plugin/README.md` for details.
-
-## Logs
-
-`%TEMP%\flaxmcp-nav\daemon.log` (rotated at 5 MB). Shadow copies in `%TEMP%\flaxmcp-nav\shadow\`.
+See `opencode-plugin/README.md`.
 
 ## License
 
-MIT — Copyright (c) 2026 Flax Game Studio. See `LICENSE`.
+MIT — Flax Game Studio
