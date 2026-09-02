@@ -1,226 +1,137 @@
 # FlaxNav by Flax Game Studio
 
-Fast C# + Flax API navigator for Flax Engine. MIT. Works on its own.
+Fast way to find C# code and Flax API. Free, MIT.
 
-This is part of my own toolbox. I built it for daily Flax work and it has saved me a lot of time — fewer wrong API guesses, fewer compile breaks, fewer editor restarts. I am sharing it as a standalone tool.
+This is from my own toolbox. I made it for my daily Flax work. It saved me a lot of time. I am sharing it. It works on its own.
 
-## Why it exists
+## Why I made it
 
-Flax Engine C# is close to Unity C# but not the same. `MonoBehaviour` does not exist here, `Rigidbody` is `RigidBody`, `Time.deltaTime` is `Time.DeltaTime`. Flax Editor search is editor-bound and slow, offline API docs are XML, and AI models trained on Unity hallucinate members that do not exist. A wrong edit fails the build, the scripting layer goes down, the bridge dies, and you lose 5 minutes restarting.
+Flax code looks like Unity code but is not the same. In Unity you write `MonoBehaviour`, in Flax it is `Script`. In Unity `Rigidbody`, in Flax `RigidBody`. AI knows Unity better so it writes wrong Flax code. You try to build, it fails, the editor closes the scripting part, you wait 5 minutes. Again and again.
 
-FlaxNav fixes that by answering two questions in 50-300ms without the editor: "does this type/member exist in Flax?" and "where is this symbol in my repo?" The OpenCode plugins then enforce that answer before any `.cs` write.
+This tool answers fast without opening the editor: "does this name exist in Flax?" and "where is this code in my project?" The plugin then stops you from saving wrong code.
 
-## Architecture at a glance
+## What it does
 
-```
-editor / AI --(JSON line)--> \\.\pipe\flaxmcp-nav --(dispatch)--> daemon
-                                                    |
-                         +--------------------------+--------------------------+
-                         |                          |                          |
-                    CsSourceIndex            FlaxApiIndex                DocsIndex
-                 (Source/**/*.cs)     (FlaxEngine.CSharp.xml)         (repo/**/*.md)
-                 file watcher TTL        + FlaxEngine.CSharp.dll       header + grep
-                                                    |                          |
-                         +--------------------------+--------------------------+
-                                                    |
-                                              --(JSON)--> client
-```
+- Find C# code in your project: find where a type is made, where it is used, search for a name, show call list.
+- Check Flax API: does this Flax type exist? What members does it have? What values can this enum have?
+- Search docs: find a section or text in markdown files.
 
-One daemon process, 8 concurrent handlers, Windows named pipe. The rest is stateless JSON over a line.
+## How it works
 
-## How the daemon works
+It is a small program that runs in the background on Windows. It listens on a named pipe `\\.\pipe\flaxmcp-nav`.
 
-### Binary and startup
+- No big tools needed. It does not need Roslyn or the Flax Editor open.
+- On first use it reads all your `Source/**/*.cs` files. About 4,000 files in our project. It makes a list: which word is in which file and on which line. It is saved in memory. Next search is 0.05 to 0.3 seconds.
+- It watches files. If you change a `.cs` file it only reads that one file again. That is fast, less than 1ms. If too many files change at once (like a build), it scans the folder and only reloads changed files.
+- It can do 8 things at the same time.
+- Flax API is read from `FlaxEngine.CSharp.xml`. About 16,000 names. Built once, about 20ms.
+- Docs are read from all `*.md` files, about 1,200 files. It saves all headers and text lowercased for fast search.
 
-`flaxmcp-nav.exe` (net8.0, `FlaxMcp.NavDaemon`, ~170KB) + `Microsoft.Data.Sqlite` + `Newtonsoft.Json`. No Roslyn, no Flax SDK install.
+You can run it one time like `flaxmcp-nav.exe csharp/symbol_search query=Bridge` or keep it running as a daemon `flaxmcp-nav.exe --daemon`. The helper `nav.ps1` starts it by itself if it is not running.
 
-Entry `Program.Main` parses `--daemon` / `--health` / `--status` / `--warm` / `--shutdown` / `--auto-start` / `atomic key=value` one-shots. Default `nav.ps1` uses `--auto-start` with `FLAXMCP_NAV_AUTOSPAWN=1` — if the pipe is missing it spawns the daemon and retries.
+Other commands: `--health` shows if it is ready and how many files it knows, `--status` shows if daemon is running, `--warm` loads all lists early so first search is not slow, `--shutdown` stops it.
 
-On daemon start: `RunDaemonEntry` opens the pipe (`CreateNamedPipe`, `PipeSecurity` allow current user), starts `PipeMonitor` (watches for stale pipe) and `AcceptPump` (loops `WaitForConnection`). Each connection is handed to a handler on the thread pool.
+Files: log is at `%TEMP%\flaxmcp-nav\daemon.log` (new file after 5 MB), copies of your edits are at `%TEMP%\flaxmcp-nav\shadow\`.
 
-### Concurrency and lifecycle
+## How the OpenCode plugin saves time
 
-- `SemaphoreSlim _gate(8,8)` — at most 8 handlers run at once. `_activeHandlers` / `_peakHandlers` tracked. Excess connections queue.
-- `CancellationToken` per request via `AsyncLocal` — if the pipe disconnects, handlers bail early.
-- Control verbs: `__ping__`, `__status__`, `__health__`, `__help__`, `__warmup__`, `__shutdown__` (needs `force=true`, refused while campaign-locked), `__campaign_lock__`/`__campaign_unlock__` (keep daemon alive across a multi-step workflow, in-memory only).
-- `--warm` eagerly builds docs + Flax API + C# indexes in background so the first real query does not pay ~5s cold cost.
+The plugin is in `opencode-plugin/`. It stops you and the AI from saving wrong `.cs` code. Without it you save, build fails, editor dies. With it the save is blocked *before* you build and it tells you what to fix.
 
-### C# index — the expensive part
+### Two parts
 
-`Program.CsharpManaged.cs` implements `CsSourceIndex` — immutable, atomically swapped via `Volatile.Read`/`Write`, read lock-free after warm.
+**1. flaxmcp-nav.ts — the tool and 3-save rule**
+It adds a tool called `flaxnav` to OpenCode. You call it before you edit.
 
-**What is indexed:**
-- Every `Source/**/*.cs` under the repo root, skipping `.git`, `.vs`, `bin`, `obj`, `node_modules`.
-- Per file: `string[] Lines`, `IReadOnlyDictionary<string, int[]> Tokens` (identifier token → distinct 1-based lines it occurs on), `Length`, `LastWriteUtc`.
+It remembers per session how many `.cs` saves you did since last check. You get 3 saves per check. On the 4th save without a new check it blocks and says: "too many saves since last check, call flaxnav again."
 
-**How it builds:**
-1. `EnumerateCsFiles` — parallel BFS, level-synchronous. Uses `EnumerateFiles`/`EnumerateDirectories` (streaming, not `GetFiles` arrays) and reuses `DirectoryInfo.Attributes` to skip reparse points. Found ~4,000 files / 870k lines in our repo.
-2. `LoadSourceFile` — `File.ReadAllLines`, tokenize by `IsIdentifierStart` (`letter|_`) + `IsIdentifierPart` (`letter|digit|_`), dedupe per-line occurrences (so `_repoRootCached` on one line counts as 1, not 2).
-3. `BuildLookups` — inverted index `token -> string[] owners` (files containing it). Presized to 128k buckets, sorted by path at birth so lookups stay sorted for free. Empty rehash avoided.
+What counts as a check: any `flaxnav` call that looks up real code and gets a good answer, like `flax_api/lookup` (does this Flax type exist?) or `csharp/symbol_search` (does this type exist in my project?). If the answer is "found 0", it does not count.
 
-Timings logged per phase: walk ~200ms, load ~parallel, invert ~ms. Full build ~19s cold; incremental is ms.
+**2. cs-edit-gates — check per file + Unity mistakes + broken code**
 
-**How it stays fresh:**
-- `FileSystemWatcher` on `*.cs` with `IncludeSubdirectories=true`, `InternalBufferSize=65536` (default 8KB overflows on any build that touches `bin/obj`). Filter is applied *after* Windows queues events for the whole subtree, so `bin/obj` churn would overflow the buffer — this is why the watcher skips those dirs on the indexing side, not the OS side.
-- `InvalidateSourceIndex` does not drop the whole index. It records `ConcurrentDictionary<string,byte> _dirtyPaths`. Next query calls `ApplyDirtyPaths` — reload only dirty indexed paths (~0.5ms each) via `CsSourceIndex.With(upserts, removals)` which shares untouched token sets.
-- If the watcher overflows (`SourceWatcherError`, 495 occurrences observed in one log), `RequiresFullRebuild` is set and next query does `ResyncSourceIndex` — directory scan + diff by `Length/LastWriteUtc`, reload only changed files, not a blind rebuild.
-- TTL fallback: `SourceIndexTtl = 5000ms` when watcher down, `1800000ms` (30 min) when watcher live — safety net only.
+It blocks `edit`, `write`, `apply_patch` on `.cs` files.
 
-**How queries use it:**
-- `ManagedFindAllReferences` — `LocationsOf(token)` union, skip `IsCommentOrString` lines.
-- `ManagedGrepRegexIndexed` — index narrows to candidate lines, then `Regex.IsMatch` + `LineContainsExactCodeToken` (code-only, skips attributes, `using`, comments, strings).
-- `ManagedSubstringTokenSearch` for `symbol_search` (`\w*query\w*`) — previously unindexed and took 60-255s; now `TokensContaining(fragment)` union → a few hundred lines, same hits, same order.
-- `Regex` cache with `IgnoreCase | CultureInvariant` and 1s timeout.
+- **Per file check (30 minutes):** One check for `Player.cs` does not allow `Enemy.cs`. Each file needs its own check. After 30 minutes you need to check again.
 
-### Flax API index
+- **Unity mistakes — 20 rules:** Flax and Unity share some names like `Vector3` so it does not block those. It only blocks names that cannot work in Flax:
 
-`FlaxApiIndex` reads `FlaxEngine.CSharp.xml` (from `FLAXMCP_FLAX_XML` env or `C:\Program Files (x86)\Flax\Flax_1.12\Binaries\Editor\Win64\{Development,Debug,Release}\FlaxEngine.CSharp.xml`).
+  `using UnityEngine` -> use `FlaxEngine`
+  `using UnityEditor` -> Flax editor code is in a plugin, not in Source/Game
+  `UnityEngine.` -> `FlaxEngine.`
+  `MonoBehaviour` -> `Script`
+  `GameObject` -> `Actor`
+  `GetComponent` -> `GetScript` or `GetChild`
+  `[SerializeField]` -> `[Serialize]`
+  `Instantiate` -> `PrefabManager.SpawnPrefab`
+  `Camera.main` -> `Camera.MainCamera`
+  `transform.position` -> `Actor.Position`
+  `Rigidbody` -> `RigidBody`
+  `Time.deltaTime` -> `Time.DeltaTime`
+  plus 8 more small traps.
 
-- Parses `<member name="T:FlaxEngine.Actor">` etc. Kind letter: `T` type, `M` method, `P` property, `F` field, `E` event. Strips `(params)` overload suffix.
-- `SimpleName` after last `.`, `DeclType` owner, `Namespace`, `BaseType` from `<Base><TypeName>` if present, `Summary`/`Remarks`/`Returns`/`Parameters` via `Flatten` (collapses whitespace, resolves `<see cref>`, `<paramref>`).
-- `LowerHaystack = simple + full + summary + ns + declType` lowercased for substring search.
-- After XML, reads `FlaxEngine.CSharp.dll` via `System.Reflection.Metadata` (never `Assembly.Load` — avoids `Newtonsoft.Json` fork bind failure). Populates `BaseType` for every type and `ObsoleteAttribute` messages keyed as `T:FlaxEngine.Actor` / `M:FlaxEngine.Actor.Position`.
+  Comments are not checked, so talking about Unity in a comment is fine.
 
-Built once, ~16k members, ~20ms. `EnsureBuilt` double-checked lock.
+- **Broken code — 2 rules that always fail to build in this project:**
 
-### Docs index
+  1. You write `using FlaxEngine;` and `using System.Numerics;` and then bare `Vector3`. Both have `Vector3` so the build does not know which one you mean. Fix: `using Vector3 = FlaxEngine.Vector3;`
+  2. You write `??=` — fails on this project's build settings.
 
-`DocsIndex` scans `repo/**/*.md` once (~1,217 files / 12 MB, <5s), caches `DocHeader` (path, rel, line, depth, text) and `DocFile` (LowerBody). Skips `bin`, `obj`, `external`, `node_modules`, `.git`, `.opencode/cache|index`, `.cache`. `FileSystemWatcher` debounced 800ms, rebuilds on change, 60s stale fallback if watcher down.
+  These two are always blocked, even if you checked the API before. A good check does not make `MonoBehaviour` work.
 
-### Dispatch, cache, shadow
+- **When it is blocked you see the fix:** 
+  `blocked edit on 'Source/Game/Foo.cs' — no check for this file. Call flaxnav with flax_api/lookup first.`
+  or `found 'MonoBehaviour' — use 'Script' in Flax.`
+  You fix in one edit.
 
-- `Program.Dispatch` maps 21 atomics (`csharp/*`, `flax_api/*`, `docs/*`, `atlas/diff_tree`, `plugin/catalog`, `receipt/*`) + 8 control verbs to handlers.
-- `ConcurrentDictionary<string,(JObject,LinkedListNode)> _cacheStore` + `_lruOrder` LRU, 512 entries, `lock _lruLock`. Hits/misses counted.
-- `Program.Shadow` copies edited file snapshots to `%TEMP%\flaxmcp-nav\shadow\` before write (for post-mortem when a compile breaks).
-- `DaemonLog` writes `%TEMP%\flaxmcp-nav\daemon.log` rotated at 5 MB ×3.
+In this free build the "check if type already exists somewhere else" rule is off when you have no inventory file. So you only get the useful checks.
 
-### Protocol
-
-Client sends one JSON line per request: `{"atomic":"csharp/symbol_search","query":"Bridge","maxResults":10}` plus optional `repoRoot`. Daemon responds with one JSON line: `{"ok":true,"count":2,"hits":[...]}` or `{"ok":false,"error":"...","errorCode":"..."}`. Every result is wrapped `{data:{...}, isError:false}` by the bridge — gates unwrap via `unwrapEnvelope`.
-
-`MaxRequestBytes = 1 MB`. Control verbs return JSON help/status/health.
-
-## How the OpenCode plugins save time
-
-Two plugins ship in `opencode-plugin/`. They are small, but together they prevent the loop: AI writes Unity code → build fails → editor dies → manual fix → repeat.
-
-### `flaxmcp-nav.ts` — the tool + 3-edit gate
-
-Registers MCP tool `flaxnav` (inputs: `atomic` + `args`). `atomic` enumerates all daemon atomics; `args` is free-form passthrough to the daemon. The plugin spawns the daemon if missing (same named pipe).
-
-Gate state per OpenCode session (`Map<sessionID, {editsSinceNav:number}>`):
-
-- `isVerificationCall(tool,args)` returns true for any `flaxnav` call whose atomic is `flax_api/*` or `csharp/*` and whose result is `ok:true` and not `count:0` (and not `unsupported_atomic`). That call is proof you checked reality.
-- `hasEditCredit` allows `MAX_EDITS_PER_NAV=3` `.cs` edits after a verification. `recordSuccessfulEdit` increments. `resetNavState` on verification success. After 3, `hasEditCredit` is false and `tool.execute.before` on `edit`/`write`/`apply_patch` for `*.cs` throws with `setNavGateProblem` — the composition layer in `command-guards.mjs` turns it into a thrown error with the fix hint.
-- The gate message is precise: `flaxnav-gate: blocked edit on 'Foo.cs' — too many .cs edits (3) since your last flaxnav call. Call flaxnav with flax_api/lookup or csharp/symbol_search first.`
-
-This alone stops the "one lookup then guess forever" pattern.
-
-### `cs-edit-gates.core.mjs` — per-file verification, Unity, compile-breaker
-
-Thin wrapper `cs-edit-gates.mjs` re-exports `lib/cs-edit-gates.core.mjs` (706 lines, patched for community). Composed in my factory via `command-guards.mjs`; in community use it directly.
-
-FILE_EDIT_TOOLS = `edit`, `write`, `apply_patch` (plus alias shapes).
-
-**Per-file binding:**
-`FILE_EDIT_TOOLS` edits carry `filePath`. The gate keeps `Map<filePath, lastVerificationTime>`. A verification for `Player.cs` does not authorize `Enemy.cs`. Each file needs its own `flaxnav` within 30 minutes. This is stricter than the 3-edit window.
-
-**Unity detection — 20 rules from `lib/unity-isms.core.mjs` (223 lines, restored from `475568d1e`):**
-
-| Pattern | Unity | Flax |
-|---|---|---|
-| `using UnityEngine` | `using UnityEngine` | `using FlaxEngine` |
-| `using UnityEditor` | `using UnityEditor` | `FlaxEditor` lives in plugin, not `Source/Game` |
-| `UnityEngine.` | `UnityEngine.*` | `FlaxEngine.*` |
-| `MonoBehaviour` | `MonoBehaviour` | `Script` |
-| `GameObject` | `GameObject` | `Actor` |
-| `GetComponent<T>` | `GetComponent<T>` | `GetScript<T>` / `GetChild<T>` |
-| `[SerializeField]` | `[SerializeField]` | `[Serialize]` |
-| `Instantiate` | `Instantiate` | `PrefabManager.SpawnPrefab` |
-| `Camera.main` | `Camera.main` | `Camera.MainCamera` |
-| `transform.position` | `transform.position` | `Actor.Position` |
-| `Rigidbody` | `Rigidbody` | `RigidBody` (capital B) |
-| `Time.deltaTime` | `Time.deltaTime` | `Time.DeltaTime` |
-| + 8 more casing traps | — | — |
-
-Shared names (`Vector3`, `Quaternion`, `Color`, `Mathf`, `Debug.Log`, `Input.GetAxis`, `OnTriggerEnter`, `Time`, `Camera`, `Script`) are never flagged. Comment lines are skipped.
-
-**Compile-breaker detection — 2 rules:**
-
-1. `using FlaxEngine; using System.Numerics;` + bare `Vector3` / `Quaternion` — ambiguous `CS0104`. `Game.Build.cs` always references `System.Numerics.Vectors`, so this fails every build. Fix: `using Vector3 = FlaxEngine.Vector3;`.
-2. `??=` — `CS1002` under the project's `LangVersion` despite `csproj` advertising 14.
-
-Both are never waived by verification — a prior lookup does not make `MonoBehaviour` compile.
-
-**Reuse gate (community-patched):**
-In my factory it also blocks creating a new type that already exists elsewhere (checks `gameside-inventory.generated.md`). In this build: `if (!fs.existsSync(".agents/gameside-inventory.generated.md")) return true` — auto-passes, so any project without that inventory gets API+Unity+compile-breaker gates only.
-
-**Error shape:**
-```
-API-VERIFY-GATE: blocked edit on 'Source/Game/Foo.cs' — no verification for this file. Call flaxnav with flax_api/lookup (for types) or flax_api/members_of (for members) or csharp/symbol_search first.
-REUSE-VERIFY-GATE: ... (not in community unless inventory present)
-UNITY-CODE-GATE: found `MonoBehaviour` — use `Script` in Flax.
-COMPILE-BREAK-GATE: ambiguous Vector3 — add alias using Vector3 = FlaxEngine.Vector3;
-```
-Each names the Flax replacement inline so the retry is one edit.
-
-### How they work together
-
-A real session:
+### How they work together — real example
 
 ```
-1. flaxnav flax_api/lookup name=Actor           -> ok:true (proof for Actor.cs, edit credit 3->0)
-2. edit  Source/Game/Actor.cs                   -> allowed (credit 1/3, file proof consumed)
-3. edit  Source/Game/Actor.cs                   -> allowed (2/3, same file needs re-verify? cs-edit-gates says per-file, so this would block — flaxmcp-nav allows, cs-edit-gates blocks. Together they are stricter.)
-4. edit  Source/Game/Other.cs                   -> blocked by cs-edit-gates per-file rule (even though flaxmcp-nav credit remains)
-5. flaxnav csharp/symbol_search query=Other     -> ok:true (proof for Other.cs)
-6. edit  Source/Game/Other.cs                   -> allowed
+1. flaxnav lookup Actor              -> found, OK for Actor.cs
+2. edit Actor.cs                     -> allowed (1 of 3)
+3. edit Other.cs                     -> blocked (Other.cs needs its own check)
+4. flaxnav search Other              -> found, OK for Other.cs
+5. edit Other.cs                     -> allowed
 ```
 
-Install both: `flaxmcp-nav.ts` covers the tool + window, `cs-edit-gates.mjs` covers content checks. Either alone helps; both together is what saved me time.
+Use both plugins together. One gives the tool and 3-save rule, the other checks the file content.
 
-## Requirements
+## What you need
 
-- .NET 8 SDK
-- Windows 10/11 (named pipe)
+- .NET 8
+- Windows 10 or 11
 
 ## Install
 
-**From source:**
+From source:
 ```pwsh
 dotnet build flaxmcp-nav.csproj -c Release
 # -> bin/Release/net8.0/flaxmcp-nav.exe
 ```
 
-**From Release:**
-Download `flax-nav-v2.3.0-with-plugin-win-x64.zip` from GitHub Releases. Contains `flaxmcp-nav.exe`, `flaxmcp-nav.dll`, deps (`Microsoft.Data.Sqlite`, `Newtonsoft.Json`, `SQLitePCLRaw.*`), `nav.ps1`, `opencode-plugin/`.
+From Release:
+Download `flax-nav-v2.3.0-with-plugin-win-x64.zip` from GitHub Releases. It has the exe, dlls, `nav.ps1`, and `opencode-plugin/`.
 
 ## Quick start
 
 ```pwsh
-# One-shot (indexes build on demand)
+# One time (no daemon needed)
 .\bin\Release\net8.0\flaxmcp-nav.exe csharp/symbol_search query=Bridge maxResults=10
 .\bin\Release\net8.0\flaxmcp-nav.exe csharp/find_definition symbolName=Player
 .\bin\Release\net8.0\flaxmcp-nav.exe flax_api/search query=Physics maxResults=5
-.\bin\Release\net8.0\flaxmcp-nav.exe docs/find_section query=flax
 
-# Via wrapper (auto-spawn if daemon missing)
+# With helper
 pwsh nav.ps1 csharp/symbol_search query=Bridge
-FLAXMCP_NAV_AUTOSPAWN=1 pwsh nav.ps1 csharp/find_definition symbolName=Player
 
-# Daemon control
+# Keep daemon running
 flaxmcp-nav.exe --daemon
 flaxmcp-nav.exe --health
-flaxmcp-nav.exe --status
 flaxmcp-nav.exe --warm
-flaxmcp-nav.exe --shutdown --force
 ```
-
-`nav.ps1` defaults to `FLAXMCP_NAV_AUTOSPAWN=1`. Set `0` for connect-only.
 
 ## OpenCode plugin install
 
-Copy the folder into your project:
+Copy the folder to your project:
 
 ```pwsh
 Copy-Item -Recurse opencode-plugin .opencode/plugin/flax-nav -Force
@@ -232,19 +143,19 @@ Add to `opencode.jsonc`:
 "plugin": ["./.opencode/plugin/flax-nav/flaxmcp-nav.ts", "./.opencode/plugin/flax-nav/cs-edit-gates.mjs"]
 ```
 
-`flaxmcp-nav.ts` = tool + 3-edit gate. `cs-edit-gates.mjs` = per-file + Unity + compile-breaker. See `opencode-plugin/README.md` for the `MAX_EDITS_PER_NAV`, `isVerificationCall`, and `gate-shared` helpers.
+See `opencode-plugin/README.md` for more.
 
-To disable locally (operator only): `FLAXMCP_NAV_GATE_DISABLE=1`.
+To turn off the block for testing: `FLAXMCP_NAV_GATE_DISABLE=1`.
 
-## Logs and troubleshooting
+## Logs
 
-- Daemon log: `%TEMP%\flaxmcp-nav\daemon.log` rotated at 5 MB ×3.
-- Shadow copies: `%TEMP%\flaxmcp-nav\shadow\`.
-- `flaxmcp-nav.exe --health` JSON: `ok`, `ready`, `version`, `uptime`, `csharpBackend`, `fileCount`, `symbolCount`, `memberCount`, `docsFileCount`, `watcherActive`, `cacheHits`/`Misses`.
-- `flaxmcp-nav.exe --status` for daemon state.
-- If source queries are slow after a build, the watcher overflowed — next query resyncs incrementally; check daemon.log for `InternalBufferOverflow`.
-- If Flax API says `xml not found`, set `FLAXMCP_FLAX_XML` to your `FlaxEngine.CSharp.xml` full path.
+- Daemon log: `%TEMP%\flaxmcp-nav\daemon.log`
+- Copies: `%TEMP%\flaxmcp-nav\shadow\`
+- `flaxmcp-nav.exe --health` shows files, symbols, members, watcher on/off.
+
+If searches are slow after a build, the watcher had too many changes. Next search reloads only changed files. Check the log for `InternalBufferOverflow`.
+If Flax API says "xml not found", set `FLAXMCP_FLAX_XML` to your `FlaxEngine.CSharp.xml` path.
 
 ## License
 
-MIT — Copyright (c) 2026 Flax Game Studio. See `LICENSE`.
+MIT — Flax Game Studio. See `LICENSE`.
