@@ -1,74 +1,59 @@
-# FlaxNav OpenCode Plugin — API-verify gate
+# FlaxNav OpenCode Plugin
 
-Blocks `edit`/`write`/`apply_patch` on `.cs` files until you verify the real Flax API via `flaxnav`. Saves compilation fails (`CS0117`, `CS0246`, stale-assembly confusion).
+Stops you from saving wrong `.cs` code. Blocks `edit` and `write` on `.cs` files until you check the real Flax API with `flaxnav`.
 
 ## What it does
 
-- **Per-file API verification:** one `flaxnav` (or `flax_api/*` / `csharp/*`) call authorizes edits to the *next* `.cs` file only. A different file needs its own verification. 30-minute timeout.
-- **3-edit window (nav gate):** each `flaxnav` call unblocks the next 3 `.cs` edits (`MAX_EDITS_PER_NAV=3`). After that you must verify again. Prevents "one lookup then guess forever".
-- **Unity-ism blocking:** refuses writes containing Unity-only constructs (`MonoBehaviour`, `GameObject`, `GetComponent<T>`, `Rigidbody` vs `RigidBody`, `Time.deltaTime` vs `Time.DeltaTime`, `using UnityEngine`, etc.) and names the Flax replacement inline.
-- **Compile-breaker blocking:** refuses the ambiguous `Vector3`/`Quaternion` when both `FlaxEngine` and `System.Numerics` are imported without an alias (`CS0104`), and `??=` which has broken this project's build.
+- **Check per file (30 minutes):** One check lets you edit the next `.cs` file only. Another file needs its own check. After 30 minutes you need to check again.
+- **3 saves per check:** Each `flaxnav` check gives you 3 `.cs` saves. After 3 you must check again. Stops "check once then guess many times".
+- **Unity mistakes:** Stops Unity-only code like `MonoBehaviour`, `GameObject`, `GetComponent`, `Rigidbody` vs `RigidBody`, `Time.deltaTime` vs `Time.DeltaTime`, `using UnityEngine` and tells you the Flax name to use.
+- **Broken code:** Stops code that will always fail to build, like using `Vector3` when you imported both `FlaxEngine` and `System.Numerics` without saying which one, and `??=` which broke this project.
 
-No inventory required in community builds — the reuse gate auto-passes when `.agents/gameside-inventory.generated.md` is absent.
+In this free build you do not need an inventory file. That check is off.
 
 ## Install
 
-Copy the `opencode-plugin/` folder into your project:
+Copy the `opencode-plugin/` folder to your project:
 
 ```pwsh
-Copy-Item -Recurse tools/flax-nav-dist/opencode-plugin .opencode/plugin/flax-nav-opencode -Force
+Copy-Item -Recurse opencode-plugin .opencode/plugin/flax-nav -Force
 ```
 
-Or add to `opencode.jsonc`:
+Add to `opencode.jsonc`:
 
 ```jsonc
-{
-  "plugin": [
-    "./opencode-plugin/flaxmcp-nav.ts",
-    "./opencode-plugin/cs-edit-gates.mjs"
-  ]
-}
+"plugin": ["./.opencode/plugin/flax-nav/flaxmcp-nav.ts", "./.opencode/plugin/flax-nav/cs-edit-gates.mjs"]
 ```
 
-`flaxmcp-nav.ts` provides the `flaxnav` tool + the 3-edit nav gate. `cs-edit-gates.mjs` adds the API-verify + Unity-ism + compile-breaker gates (composed via `command-guards.mjs` in the factory). Recommend both — `flaxmcp-nav.ts` alone covers the tool, `cs-edit-gates.mjs` covers the content checks.
+`flaxmcp-nav.ts` gives you the `flaxnav` tool and the 3-save rule. `cs-edit-gates.mjs` checks the file per file and for Unity/broken code. Use both.
 
-Single composited alternative (factory `command-guards.mjs` composes all gates, but community keeps them separate for clarity):
-
-```jsonc
-{ "plugin": ["./opencode-plugin/flaxmcp-nav.ts"] }
-```
-
-already blocks on missing `flaxnav`; add `cs-edit-gates.mjs` for the content gates.
-
-## Usage
+## How to use
 
 ```ts
-// 1. Verify API exists (any of these counts)
+// 1. Check that the name exists
 await flaxnav({ atomic: "flax_api/lookup", args: { name: "Actor" } });
 await flaxnav({ atomic: "csharp/symbol_search", args: { query: "MyType" } });
 
-// 2. Now edit .cs — gate passes
+// 2. Now save .cs — it works
 await edit({ filePath: "Source/Game/MyScript.cs", oldString: "...", newString: "..." });
 
-// 3. Fourth .cs edit without re-verifying → blocked with fix hint
-// flaxnav-gate: blocked edit on 'Foo.cs' — too many .cs edits (3) since your last flaxnav call.
+// 3. 4th save without a new check -> blocked
+// "too many saves (3) since last flaxnav, call flaxnav again"
 ```
 
-Error text tells the fix: call `flaxnav` with the correct atomic/args, then retry. Members and enum cases need `flax_api/members_of` / `flax_api/enum_values`, not just `lookup`.
+If it blocks, it tells you what to call, then try again. For a member or enum value you need `flax_api/members_of` or `enum_values`, not just `lookup`.
 
-## Escape hatch
+## Turn off for testing
 
-Operator only: `FLAXMCP_NAV_GATE_DISABLE=1` disables the nav gate.
+Set `FLAXMCP_NAV_GATE_DISABLE=1`.
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `flaxmcp-nav.ts` | `flaxnav` tool + `MAX_EDITS_PER_NAV=3` gate |
-| `cs-edit-gates.mjs` | thin wrapper re-exporting `lib/cs-edit-gates.core.mjs` |
-| `lib/cs-edit-gates.core.mjs` | API-verify + Unity-ism + compile-breaker logic (patched for community: `fs.existsSync` inventory guard, local `./unity-isms.core.mjs` import) |
-| `lib/flaxmcp-nav-gate.core.mjs` | 3-edit window state |
-| `lib/gate-shared.core.mjs` | shared `innerNameOf`/`callFailed` helpers |
-| `lib/behavior-synonyms.mjs` | synonym → folder map for reuse gate |
-| `lib/unity-isms.core.mjs` | 20 Unity rules + compile-breaker rules (restored from `475568d1e`) |
-| `lib/flaxmcp-tool-aliases.core.mjs` | `injectCountZeroTerminalNote` + composite detection |
+- `flaxmcp-nav.ts` — tool + 3-save rule
+- `cs-edit-gates.mjs` — wrapper for the checks
+- `lib/cs-edit-gates.core.mjs` — the checks
+- `lib/flaxmcp-nav-gate.core.mjs` — counts saves
+- `lib/unity-isms.core.mjs` — 20 Unity rules
+- `lib/gate-shared.core.mjs` — small helpers
+- `lib/behavior-synonyms.mjs` — for reuse check
+- `lib/flaxmcp-tool-aliases.core.mjs` — for messages
