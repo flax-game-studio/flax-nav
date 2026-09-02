@@ -245,10 +245,6 @@ To disable locally (operator only): `FLAXMCP_NAV_GATE_DISABLE=1`.
 - If source queries are slow after a build, the watcher overflowed — next query resyncs incrementally; check daemon.log for `InternalBufferOverflow`.
 - If Flax API says `xml not found`, set `FLAXMCP_FLAX_XML` to your `FlaxEngine.CSharp.xml` full path.
 
-## What this is part of
-
-Part of my own toolbox at Flax Game Studio. This build is self-contained (vendored `SwallowedCatch.cs`, no `FlaxMcp.Core`). It is useful alone. More exists in my private factory (scene/world/physics/AI, asset pipeline, compute router). This is the piece I can share.
-
 ## License
 
 MIT — Copyright (c) 2026 Flax Game Studio. See `LICENSE`.
